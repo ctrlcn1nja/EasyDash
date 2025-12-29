@@ -1,7 +1,7 @@
 def process_fuel(sm): 
     fuel_left = sm.Physics.fuel
     fuel_per_lap = sm.Graphics.fuel_per_lap
-    last_lap_time = sm.Graphics.last_time_lap or 0.0 # TODO: we need to asumme lap time here 
+    last_lap_time = sm.Graphics.last_time
     session_time_left = sm.Graphics.session_time_left  
     laps_left = int(session_time_left // last_lap_time) + 1
     fuel_needed = fuel_per_lap * laps_left

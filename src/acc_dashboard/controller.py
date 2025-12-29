@@ -1,5 +1,6 @@
 from PySide6.QtCore import QTimer
 from .processors.fuel import process_fuel
+from .processors.tires import process_tires
 
 
 class AppController:
@@ -22,3 +23,5 @@ class AppController:
             return
         d = process_fuel(sm)
         self.window.fuel_card.update_view(d)
+        tire_data = process_tires(sm)
+        self.window.tires_card.update_view(tire_data)
