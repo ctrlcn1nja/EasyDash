@@ -1,0 +1,2 @@
+[console_scripts]
+acc-dashboard = acc_dashboard.main:main

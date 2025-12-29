@@ -1,0 +1,3 @@
+from pyaccsharedmemory import accSharedMemory
+
+

@@ -1,0 +1,8 @@
+[project]
+name = "acc-dashboard"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["PySide6"]
+
+[project.scripts]
+acc-dashboard = "acc_dashboard.main:main"
