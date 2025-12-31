@@ -22,7 +22,7 @@ def load_points_from_file(path: Path):
     raw = json.loads(path.read_text(encoding="utf-8"))
 
     if isinstance(raw, dict):
-        pts = raw.get("points", raw.get("car_coordinates", raw.get("coords")))
+        pts = raw.get("points", raw.get("points_Barcelona", raw.get("coords")))
     else:
         pts = raw
 
