@@ -67,6 +67,8 @@ class MiniMapWidget(QWidget):
             p.drawPath(path)
 
         for car in self._cars:
+            if car["x"] == 0 and car["z"] == 0:
+                continue
             pt = self._world_to_screen(car["x"], car["z"])
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(120, 255, 180) if car.get("is_player") else QColor(255, 255, 255, 160))
