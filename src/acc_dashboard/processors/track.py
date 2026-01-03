@@ -49,7 +49,7 @@ def process_track(sm):
         v = coords[i]
         car_id = ids[i] if ids is not None and i < len(ids) else None
         is_player = (car_id == player_id) if (car_id is not None and player_id is not None) else False
-        cars.append({"x": float(v.x), "y": float(v.y), "z": float(v.z), "is_player": is_player})
+        cars.append({"x": float(v.x), "y": float(v.y), "z": float(v.z), "car_id": car_id, "is_player": is_player})
 
     track_points = load_track_points(path_to_points)
 
@@ -59,4 +59,5 @@ def process_track(sm):
         "flag": flag,
         "track_points": track_points,       
         "cars_coordinates": cars,
+        "player_car_id": player_id,
     }

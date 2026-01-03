@@ -16,14 +16,73 @@ class MiniMapWidget(QWidget):
         super().__init__(parent)
         self._track_pts = []
         self._cars = []
-        self._bounds = None
+        self._player_car_id = None
+        self._pace_list = {} # car_id to list of track points
         self.setMinimumHeight(260)
 
-    def set_data(self, track_pts, cars):
+    def set_data(self, track_pts, cars, player_car_id=None):
         self._track_pts = [(float(x), float(z)) for x, z in (track_pts or [])]
         self._cars = cars or []
         self._bounds = self._compute_bounds(self._track_pts) if self._track_pts else None
+        self._player_car_id = player_car_id
+        for car in self._cars:
+            #print(self._cars, cars)
+            car_id = car.get("car_id")
+            if car_id is not None and car_id not in self._pace_list:
+                points = {}
+                for i in range(len(self._track_pts)):
+                    points[self._track_pts[i]] = {"speed": 0.0, "next_point": self._track_pts[(i + 1) % len(self._track_pts)]}
+                self._pace_list[car_id] = {'points': points, 'last_point_seen': None}
         self.update()
+
+    def find_closest_track_point(self, x, z):
+        if not self._track_pts:
+            return None
+        closest_pt = None
+        closest_dist = float('inf')
+        for pt in self._track_pts:
+            dx = pt[0] - x
+            dz = pt[1] - z
+            dist = (dx * dx) + (dz * dz)
+            if dist < closest_dist:
+                closest_dist = dist
+                closest_pt = pt
+        return closest_pt
+
+    
+    def compute_paces(self):
+        for car in self._cars:
+            car_id = car.get("car_id")
+            if car_id is None or car_id not in self._pace_list:
+                continue
+            pace_data = self._pace_list[car_id]
+            points = pace_data['points']
+            last_point_seen = pace_data['last_point_seen']
+
+            closest_pt = self.find_closest_track_point(self._cars[car_id].get("x"), self._cars[car_id].get("z"))
+            if closest_pt is None:
+                continue
+
+            if last_point_seen is None:
+                pace_data['last_point_seen'] = closest_pt
+                continue
+            
+            if closest_pt != last_point_seen:
+                #print(f"Car {car_id} moved from {last_point_seen} to {closest_pt}")
+                speed = (closest_pt[0] - last_point_seen[0])**2 + (closest_pt[1] - last_point_seen[1])**2
+                while last_point_seen != closest_pt:
+                    points[last_point_seen]['speed'] = speed
+                    last_point_seen = points[last_point_seen]['next_point']
+                pace_data['last_point_seen'] = closest_pt   
+
+
+    def compute_car_ahead(self):
+        pass
+
+
+
+    def compute_track_dominance(self):
+        self.compute_paces()     
 
     @staticmethod
     def _compute_bounds(pts):
@@ -53,26 +112,62 @@ class MiniMapWidget(QWidget):
         sy = self.height() - sy
 
         return QPointF(sx, sy)
+    
 
-    def paintEvent(self, _):
+    
+
+
+    def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
+        try:
+            p.setRenderHint(QPainter.Antialiasing, True)
 
-        if len(self._track_pts) >= 2:
-            path = QPainterPath()
-            path.moveTo(self._world_to_screen(*self._track_pts[0]))
-            for x, z in self._track_pts[1:]:
-                path.lineTo(self._world_to_screen(x, z))
-            p.setPen(QPen(QColor(255, 255, 255, 90), 3))
-            p.drawPath(path)
+            # ---- guards (avoid exceptions inside paint) ----
+            if not self._track_pts or len(self._track_pts) < 2:
+                return
 
-        for car in self._cars:
-            if car["x"] == 0 and car["z"] == 0:
-                continue
-            pt = self._world_to_screen(car["x"], car["z"])
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(120, 255, 180) if car.get("is_player") else QColor(255, 255, 255, 160))
-            p.drawEllipse(pt, 6 if car.get("is_player") else 4, 6 if car.get("is_player") else 4)
+            if self._player_car_id is None:
+                return
+
+            player_pace = self._pace_list.get(self._player_car_id)
+            if not player_pace:
+                return
+
+            points = player_pace.get("points", {})
+            if not points:
+                return
+
+            # If you must compute here, keep it safe (but ideally do it elsewhere)
+            self.compute_track_dominance()
+
+            # ---- draw track segments ----
+            for (x1, z1), (x2, z2) in zip(self._track_pts, self._track_pts[1:]):
+                sp = points.get((x1, z1), {}).get("speed", 0.0)
+                col = QColor(120, 255, 180) if sp > 0.0 else QColor(255, 120, 120)
+                p.setPen(QPen(col, 3))
+                p.drawLine(self._world_to_screen(x1, z1), self._world_to_screen(x2, z2))
+
+            # close the loop (use last segment's color safely)
+            x1, z1 = self._track_pts[-1]
+            x2, z2 = self._track_pts[0]
+            sp = points.get((x1, z1), {}).get("speed", 0.0)
+            col = QColor(120, 255, 180) if sp > 0.0 else QColor(255, 120, 120)
+            p.setPen(QPen(col, 3))
+            p.drawLine(self._world_to_screen(x1, z1), self._world_to_screen(x2, z2))
+
+            # ---- draw cars ----
+            for car in self._cars:
+                if car.get("x") == 0 and car.get("z") == 0:
+                    continue
+                pt = self._world_to_screen(car["x"], car["z"])
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(120, 255, 180) if car.get("is_player") else QColor(255, 255, 255, 160))
+                r = 6 if car.get("is_player") else 4
+                p.drawEllipse(pt, r, r)
+
+        finally:
+            if p.isActive():
+                p.end()
 
 
 # =========================================================
@@ -105,7 +200,7 @@ class TrackCard(QFrame):
 
     def update_view(self, d):
         self.track_name.setText(d.get("track_name", "—"))
-        self.map.set_data(d.get("track_points"), d.get("cars_coordinates", []))
+        self.map.set_data(d.get("track_points"), d.get("cars_coordinates", []), d.get("player_car_id", None))
 
 
 # =========================================================
