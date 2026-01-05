@@ -12,19 +12,36 @@ import time
 # Mini Map
 # =========================================================
 
+import time
+
+from PySide6.QtWidgets import QWidget
+from PySide6.QtGui import QPainter, QPen, QColor
+from PySide6.QtCore import Qt, QPointF
+
+
 class MiniMapWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+
         self._track_pts = []
         self._cars = []
+        self._bounds = None
         self._player_car_id = None
-        self._pace_list = {}  # car_id to list of track points
-        # self._target_car_id = None
-        self.setMinimumHeight(260)
 
-        # High-resolution monotonic clock
+        # car_id -> per-car pace data
+        self._pace_list = {}
+
         self.clock = time.perf_counter
 
+        # sector config
+        self._sector_len = 10
+        self._sector_count = 0
+        self._pt_index = {}
+
+        self.setMinimumHeight(260)
+
+    def set_sector_count(self, n: int):
+        self._sector_count = max(0, int(n))
 
     def set_data(self, track_pts, cars, player_car_id=None):
         self._track_pts = [(float(x), float(z)) for x, z in (track_pts or [])]
@@ -32,31 +49,63 @@ class MiniMapWidget(QWidget):
         self._bounds = self._compute_bounds(self._track_pts) if self._track_pts else None
         self._player_car_id = player_car_id
 
+        # point -> index
+        self._pt_index = {pt: i for i, pt in enumerate(self._track_pts)}
+
+        # sector sizing
+        if self._track_pts:
+            if self._sector_count > 0:
+                self._sector_len = max(1, len(self._track_pts) // self._sector_count)
+            else:
+                self._sector_count = max(
+                    1, (len(self._track_pts) + self._sector_len - 1) // self._sector_len
+                )
+
         now = self.clock()
 
         for car in self._cars:
             car_id = car.get("car_id")
-            if car_id is not None and car_id not in self._pace_list:
+            if car_id is None:
+                continue
+
+            if car_id not in self._pace_list:
+                # per-point map (linked list)
                 points = {}
                 for i in range(len(self._track_pts)):
-                    points[self._track_pts[i]] = {
+                    pt = self._track_pts[i]
+                    points[pt] = {
                         "speed": 0.0,
                         "last_speed": 0.0,
-                        "next_point": self._track_pts[(i + 1) % len(self._track_pts)]
+                        "next_point": self._track_pts[(i + 1) % len(self._track_pts)],
                     }
-                self._pace_list[car_id] = {
-                    'points': points,
-                    'last_point_seen': None,
-                    'last_time_seen': now  # <-- added
-                }
-        self.update()
 
+                # per-sector stats:
+                # avg = latest completed sector value
+                # prev_avg = previous completed value (for delta)
+                sectors = {}
+                for s in range(self._sector_count):
+                    sectors[s] = {
+                        "avg": 0.0,
+                        "prev_avg": 0.0,
+                        "sum": 0.0,
+                        "cnt": 0,
+                    }
+
+                self._pace_list[car_id] = {
+                    "points": points,
+                    "last_point_seen": None,
+                    "last_time_seen": now,
+                    "sectors": sectors,
+                    "last_sector": None,
+                }
+
+        self.update()
 
     def find_closest_track_point(self, x, z):
         if not self._track_pts:
             return None
         closest_pt = None
-        closest_dist = float('inf')
+        closest_dist = float("inf")
         for pt in self._track_pts:
             dx = pt[0] - x
             dz = pt[1] - z
@@ -66,8 +115,26 @@ class MiniMapWidget(QWidget):
                 closest_pt = pt
         return closest_pt
 
+    def _commit_sector(self, pace_data, sector_id: int):
+        """Commit the running sum/cnt into avg, shifting avg -> prev_avg."""
+        if sector_id is None:
+            return
+        sec = pace_data["sectors"].get(sector_id)
+        if not sec:
+            return
+        if sec["cnt"] <= 0:
+            return
+
+        new_avg = sec["sum"] / max(sec["cnt"], 1)
+        sec["prev_avg"] = sec["avg"]
+        sec["avg"] = new_avg
+        sec["sum"] = 0.0
+        sec["cnt"] = 0
 
     def compute_paces(self):
+        if not self._track_pts:
+            return
+
         for car in self._cars:
             car_id = car.get("car_id")
             if car_id is None or car_id not in self._pace_list:
@@ -76,105 +143,110 @@ class MiniMapWidget(QWidget):
                 continue
 
             pace_data = self._pace_list[car_id]
-            points = pace_data['points']
-            last_point_seen = pace_data['last_point_seen']
+            points = pace_data["points"]
 
             closest_pt = self.find_closest_track_point(car["x"], car["z"])
             if closest_pt is None:
                 continue
 
             now = self.clock()
-            last_time = pace_data.get('last_time_seen', now)
+            last_time = pace_data.get("last_time_seen", now)
             dt = now - last_time
+            last_point_seen = pace_data.get("last_point_seen")
 
-            # First observation → initialize only
+            # First observation
             if last_point_seen is None:
-                pace_data['last_point_seen'] = closest_pt
-                pace_data['last_time_seen'] = now
+                pace_data["last_point_seen"] = closest_pt
+                pace_data["last_time_seen"] = now
+                pace_data["last_sector"] = None
                 continue
 
-            # Safety guard
             if dt <= 1e-6:
                 continue
 
-            #print(closest_pt, last_point_seen)
-
             if closest_pt != last_point_seen:
-                # Euclidean distance between track points
                 dx = closest_pt[0] - last_point_seen[0]
                 dz = closest_pt[1] - last_point_seen[1]
                 distance = (dx * dx + dz * dz) ** 0.5
-
-                speed = distance / dt  # <-- time-aware speed
+                speed = distance / dt
 
                 while last_point_seen != closest_pt:
-                    points[last_point_seen]['last_speed'] = points[last_point_seen]['speed']
-                    points[last_point_seen]['speed'] = speed
-                    last_point_seen = points[last_point_seen]['next_point']
+                    # per-point
+                    points[last_point_seen]["last_speed"] = points[last_point_seen]["speed"]
+                    points[last_point_seen]["speed"] = speed
 
-                pace_data['last_point_seen'] = closest_pt
-                pace_data['last_time_seen'] = now
+                    # sector id for this point
+                    idx = self._pt_index.get(last_point_seen)
+                    if idx is not None and self._sector_count > 0:
+                        s = idx // self._sector_len
+                        if s >= self._sector_count:
+                            s = self._sector_count - 1
 
+                        prev_s = pace_data.get("last_sector")
+                        if prev_s is None:
+                            pace_data["last_sector"] = s
+                        elif s != prev_s:
+                            # leaving prev sector -> commit it
+                            self._commit_sector(pace_data, prev_s)
+                            pace_data["last_sector"] = s
 
-    # def compute_car_ahead(self, car_points):
-    #     ...
-    # (unchanged, kept exactly as requested)
+                        # accumulate current sector
+                        sec = pace_data["sectors"][s]
+                        sec["sum"] += speed
+                        sec["cnt"] += 1
 
+                    last_point_seen = points[last_point_seen]["next_point"]
+
+                pace_data["last_point_seen"] = closest_pt
+                pace_data["last_time_seen"] = now
 
     def compute_track_dominance(self, x, z):
-        # Neutral gray fallback
         NEUTRAL = QColor(200, 200, 200)
 
         if self._player_car_id is None:
             return NEUTRAL
-
         player_pace = self._pace_list.get(self._player_car_id)
         if not player_pace:
             return NEUTRAL
 
-        player_point_data = player_pace['points'].get((x, z))
-        if not player_point_data:
+        idx = self._pt_index.get((x, z))
+        if idx is None or self._sector_count <= 0:
             return NEUTRAL
 
-        v = float(player_point_data.get('speed', 0.0))
-        v_prev = float(player_point_data.get('last_speed', 0.0))
+        s = idx // self._sector_len
+        if s >= self._sector_count:
+            s = self._sector_count - 1
 
-        # If we don't have meaningful history yet
-        if v <= 0.0 or v_prev <= 0.0:
+        sec = player_pace["sectors"].get(s)
+        if not sec:
             return NEUTRAL
 
-        # Relative change (stable across different absolute speeds)
-        # >0 means improvement, <0 means worse
+        v = float(sec.get("avg", 0.0))
+        v_prev = float(sec.get("prev_avg", 0.0))
+
+        # Need at least two completed passes of that sector to compare
+        # if v <= 0.0 or v_prev <= 0.0:
+        #     return NEUTRAL
+
         rel = (v - v_prev) / max(v_prev, 1e-6)
 
-        # Dead-zone: ignore tiny changes to reduce noise/flicker
-        dead = 0.1  # 10%
+        dead = 0.03
         if abs(rel) < dead:
             return NEUTRAL
 
-        # Clamp: map rel change into [-1, 1] with saturation
-        # e.g. +/- 12% becomes "full intensity"
-        sat = 0.12
+        sat = 0.10
         t = max(-1.0, min(1.0, rel / sat))
-
-        # Intensity scaling (0..1)
         a = abs(t)
 
-        # Continuous gradient: gray -> red or gray -> green
-        # Keep it simple and readable
         base_r, base_g, base_b = 200, 200, 200
-
         if t > 0:
-            # Toward green
             target_r, target_g, target_b = 100, 255, 100
         else:
-            # Toward red
             target_r, target_g, target_b = 255, 100, 100
 
         r = int(base_r + (target_r - base_r) * a)
         g = int(base_g + (target_g - base_g) * a)
         b = int(base_b + (target_b - base_b) * a)
-
         return QColor(r, g, b)
 
     @staticmethod
@@ -205,48 +277,33 @@ class MiniMapWidget(QWidget):
         sy = self.height() - sy
 
         return QPointF(sx, sy)
-    
-
-    
-
 
     def paintEvent(self, event):
         p = QPainter(self)
         try:
             p.setRenderHint(QPainter.Antialiasing, True)
 
-            # ---- guards (avoid exceptions inside paint) ----
             if not self._track_pts or len(self._track_pts) < 2:
                 return
-
             if self._player_car_id is None:
                 return
-
-            player_pace = self._pace_list.get(self._player_car_id)
-            if not player_pace:
+            if self._player_car_id not in self._pace_list:
                 return
 
-            points = player_pace.get("points", {})
-            if not points:
-                return
-
-            # If you must compute here, keep it safe (but ideally do it elsewhere)
-            
-            self.compute_paces() 
-            # ---- draw track segments ----
+            # draw track segments
             for (x1, z1), (x2, z2) in zip(self._track_pts, self._track_pts[1:]):
                 col = self.compute_track_dominance(x1, z1)
                 p.setPen(QPen(col, 3))
                 p.drawLine(self._world_to_screen(x1, z1), self._world_to_screen(x2, z2))
 
-            # close the loop (use last segment's color safely)
+            # close loop
             x1, z1 = self._track_pts[-1]
             x2, z2 = self._track_pts[0]
             col = self.compute_track_dominance(x1, z1)
             p.setPen(QPen(col, 3))
             p.drawLine(self._world_to_screen(x1, z1), self._world_to_screen(x2, z2))
 
-            # ---- draw cars ----
+            # draw cars
             for car in self._cars:
                 if car.get("x") == 0 and car.get("z") == 0:
                     continue
@@ -259,8 +316,6 @@ class MiniMapWidget(QWidget):
         finally:
             if p.isActive():
                 p.end()
-
-
 # =========================================================
 # Track Card
 # =========================================================
@@ -292,6 +347,8 @@ class TrackCard(QFrame):
     def update_view(self, d):
         self.track_name.setText(d.get("track_name", "—"))
         self.map.set_data(d.get("track_points"), d.get("cars_coordinates", []), d.get("player_car_id", None))
+        self.map.compute_paces()
+        self.map.update()
 
 
 # =========================================================
