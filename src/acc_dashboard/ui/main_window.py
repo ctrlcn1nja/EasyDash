@@ -163,6 +163,13 @@ class MiniMapWidget(QWidget):
 
             if dt <= 1e-6:
                 continue
+            
+            if (self._pt_index.get(closest_pt) < self._pt_index.get(last_point_seen)) & (self._pt_index.get(closest_pt) > (self._pt_index.get(last_point_seen) + self._sector_len)):
+                # jumped backwards or too far forwards - reset
+                pace_data["last_point_seen"] = closest_pt
+                pace_data["last_time_seen"] = now
+                pace_data["last_sector"] = None
+                continue
 
             if closest_pt != last_point_seen:
                 dx = closest_pt[0] - last_point_seen[0]
