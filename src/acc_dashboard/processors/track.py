@@ -44,6 +44,7 @@ def process_track(sm):
     coords = sm.Graphics.car_coordinates  
     ids = getattr(sm.Graphics, "car_id", None)
     player_id = getattr(sm.Graphics, "player_car_id", None)
+    player_car_rotation = getattr(sm.Physics, "heading", None)
 
     for i in range(len(coords)):
         v = coords[i]
@@ -60,4 +61,5 @@ def process_track(sm):
         "track_points": track_points,       
         "cars_coordinates": cars,
         "player_car_id": player_id,
+        "player_car_rotation": player_car_rotation
     }

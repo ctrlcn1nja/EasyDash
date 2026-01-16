@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QLabel, QFrame,
     QVBoxLayout, QHBoxLayout, QGridLayout, QProgressBar
 )
-from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QPainterPath
+from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QPainterPath,  QPixmap, QPainter
 from PySide6.QtCore import Qt, QPointF, QRectF
 import time 
 
@@ -37,18 +37,19 @@ class MiniMapWidget(QWidget):
         self._sector_len = 10
         self._sector_count = 0
         self._pt_index = {}
+        self._player_car_rotation = None
 
         self.setMinimumHeight(260)
 
     def set_sector_count(self, n: int):
         self._sector_count = max(0, int(n))
 
-    def set_data(self, track_pts, cars, player_car_id=None):
+    def set_data(self, track_pts, cars, player_car_id=None, player_car_rotation=None):
         self._track_pts = [(float(x), float(z)) for x, z in (track_pts or [])]
         self._cars = cars or []
         self._bounds = self._compute_bounds(self._track_pts) if self._track_pts else None
         self._player_car_id = player_car_id
-
+        self._player_car_rotation = player_car_rotation
         # point -> index
         self._pt_index = {pt: i for i, pt in enumerate(self._track_pts)}
 
@@ -284,6 +285,27 @@ class MiniMapWidget(QWidget):
         sy = self.height() - sy
 
         return QPointF(sx, sy)
+    
+    def draw_player_marker(self, p: QPainter, pt: QPointF):
+        rotation = float(self._player_car_rotation or 0.0)  
+        rotation_deg = rotation * (180.0 / 3.14159265)
+
+        pm = QPixmap("src/acc_dashboard/resources/images/player_marker.png")
+        w, h = 16, 16
+
+        p.save()
+
+        # optional: nicer looking scaling/rotation
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+        # rotate around the marker center
+        p.translate(pt.x(), pt.y())
+        p.rotate(-rotation_deg)          # minus if your angle sign is opposite of Qt's CCW
+        p.drawPixmap(-w/2, -h/2, w, h, pm)
+
+        p.restore()
+
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -316,9 +338,12 @@ class MiniMapWidget(QWidget):
                     continue
                 pt = self._world_to_screen(car["x"], car["z"])
                 p.setPen(Qt.NoPen)
-                p.setBrush(QColor(120, 255, 180) if car.get("is_player") else QColor(255, 255, 255, 160))
-                r = 6 if car.get("is_player") else 4
-                p.drawEllipse(pt, r, r)
+                if car.get("is_player"):
+                    self.draw_player_marker(p, pt)
+                else:
+                    p.setBrush(QBrush(QColor(200, 200, 200, 180)))
+                    r = 5
+                    p.drawEllipse(pt, r, r)
 
         finally:
             if p.isActive():
@@ -353,7 +378,7 @@ class TrackCard(QFrame):
 
     def update_view(self, d):
         self.track_name.setText(d.get("track_name", "—"))
-        self.map.set_data(d.get("track_points"), d.get("cars_coordinates", []), d.get("player_car_id", None))
+        self.map.set_data(d.get("track_points"), d.get("cars_coordinates", []), d.get("player_car_id", None), d.get("player_car_rotation", None))
         self.map.compute_paces()
         self.map.update()
 
