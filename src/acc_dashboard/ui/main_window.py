@@ -1,12 +1,13 @@
 import sys
 import ctypes
 import ctypes.wintypes as _wt
+from collections import deque
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QLabel, QFrame,
     QVBoxLayout, QHBoxLayout, QGridLayout, QProgressBar, QPushButton
 )
 from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QPixmap
-from PySide6.QtCore import Qt, QPointF, QRectF, QAbstractNativeEventFilter
+from PySide6.QtCore import Qt, QPointF, QAbstractNativeEventFilter
 import time
 
 # =========================================================
@@ -230,7 +231,16 @@ class MiniMapWidget(QWidget):
             if dt <= 1e-6:
                 continue
 
-            if (self._pt_index.get(closest_pt) < self._pt_index.get(last_point_seen)) & (self._pt_index.get(closest_pt) > (self._pt_index.get(last_point_seen) + self._sector_len)):
+            cur_idx  = self._pt_index.get(closest_pt)
+            last_idx = self._pt_index.get(last_point_seen)
+            if cur_idx is None or last_idx is None:
+                # Stale point from a previous track load — reset
+                pace_data["last_point_seen"] = closest_pt
+                pace_data["last_time_seen"] = now
+                pace_data["last_sector"] = None
+                continue
+
+            if cur_idx < last_idx and cur_idx > last_idx + self._sector_len:
                 pace_data["last_point_seen"] = closest_pt
                 pace_data["last_time_seen"] = now
                 pace_data["last_sector"] = None
@@ -243,6 +253,8 @@ class MiniMapWidget(QWidget):
                 speed = distance / dt
 
                 while last_point_seen != closest_pt:
+                    if last_point_seen not in points:
+                        break
                     points[last_point_seen]["last_speed"] = points[last_point_seen]["speed"]
                     points[last_point_seen]["speed"] = speed
 
@@ -295,7 +307,25 @@ class MiniMapWidget(QWidget):
             ref = float(sec.get("prev_avg", 0.0))
             if ref <= 0.0:
                 return None
-        else:
+        elif self._compare_mode == "vs_best":
+            # Find the single fastest opponent overall so we compare against one
+            # real car, not a cherry-picked per-sector maximum across different cars.
+            best_pace = None
+            best_total = 0.0
+            for pd in self._pace_list.values():
+                if pd is player_pace:
+                    continue
+                total = sum(float(sec2["avg"]) for sec2 in pd["sectors"].values() if sec2["avg"] > 0.0)
+                if total > best_total:
+                    best_total = total
+                    best_pace = pd
+            if best_pace is None:
+                return None
+            ref_sec = best_pace["sectors"].get(s)
+            if ref_sec is None or ref_sec["avg"] <= 0.0:
+                return None
+            ref = float(ref_sec["avg"])
+        else:  # vs_avg
             opponent_speeds = [
                 float(pd["sectors"][s]["avg"])
                 for pd in self._pace_list.values()
@@ -305,7 +335,7 @@ class MiniMapWidget(QWidget):
             ]
             if not opponent_speeds:
                 return None
-            ref = max(opponent_speeds) if self._compare_mode == "vs_best" else sum(opponent_speeds) / len(opponent_speeds)
+            ref = sum(opponent_speeds) / len(opponent_speeds)
 
         rel = (v - ref) / max(ref, 1e-6)
 
@@ -475,24 +505,22 @@ class TyreTile(QWidget):
         super().__init__()
         self.label = label
         self.temp = None
-        self.grip = None
-        self.setMinimumSize(100, 72)
+        self.setMinimumSize(70, 50)
 
-    def set_values(self, temp, grip):
+    def set_values(self, temp, *_):
         self.temp = temp
-        self.grip = grip
         self.update()
 
     def _temp_color(self):
         if self.temp is None:
-            return QColor(55, 55, 62)
+            return QColor(38, 38, 44)
         if self.temp < 70:
-            return QColor(55, 125, 255)
+            return QColor(32, 80, 185)
         if self.temp < 90:
-            return QColor(45, 215, 125)
+            return QColor(30, 155, 80)
         if self.temp < 105:
-            return QColor(255, 160, 25)
-        return QColor(255, 55, 55)
+            return QColor(185, 108, 15)
+        return QColor(185, 35, 35)
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -500,48 +528,26 @@ class TyreTile(QWidget):
 
         rect = self.rect().adjusted(1, 1, -1, -1)
 
-        # Background
-        p.setBrush(QColor(13, 13, 15))
-        p.setPen(QPen(QColor(255, 255, 255, 14)))
-        p.drawRoundedRect(rect, 3, 3)
-
-        # Left accent bar — temperature colour
+        # Fill entire tile with temp colour
         p.setBrush(self._temp_color())
         p.setPen(Qt.NoPen)
-        p.drawRoundedRect(QRectF(rect.left(), rect.top(), 3, rect.height()), 1.5, 1.5)
+        p.drawRoundedRect(rect, 3, 3)
 
         # Corner label (FL / FR / RL / RR)
         f = p.font()
-        f.setPointSize(7)
+        f.setPointSize(6)
         f.setBold(False)
         p.setFont(f)
-        p.setPen(QColor(255, 255, 255, 75))
-        p.drawText(rect.adjusted(10, 5, -4, 0), Qt.AlignTop | Qt.AlignLeft, self.label)
+        p.setPen(QColor(255, 255, 255, 110))
+        p.drawText(rect.adjusted(5, 4, -3, 0), Qt.AlignTop | Qt.AlignLeft, self.label)
 
         # Temperature — dominant value
         temp_text = "—" if self.temp is None else f"{self.temp:.0f}°"
-        f.setPointSize(15)
+        f.setPointSize(13)
         f.setBold(True)
         p.setFont(f)
-        p.setPen(QColor(255, 255, 255, 225))
-        p.drawText(rect.adjusted(6, 0, 0, -10), Qt.AlignCenter, temp_text)
-
-        # Wear bar at bottom
-        if self.grip is not None:
-            w = max(0.0, min(1.0, self.grip))
-            bg_bar = QRectF(rect.left() + 10, rect.bottom() - 10, rect.width() - 16, 4)
-            fill_bar = QRectF(rect.left() + 10, rect.bottom() - 10, (rect.width() - 16) * w, 4)
-            p.setBrush(QColor(255, 255, 255, 18))
-            p.setPen(Qt.NoPen)
-            p.drawRoundedRect(bg_bar, 2, 2)
-            if w > 0.5:
-                wear_col = QColor(45, 215, 125)
-            elif w > 0.25:
-                wear_col = QColor(255, 160, 25)
-            else:
-                wear_col = QColor(255, 55, 55)
-            p.setBrush(wear_col)
-            p.drawRoundedRect(fill_bar, 2, 2)
+        p.setPen(QColor(255, 255, 255, 230))
+        p.drawText(rect, Qt.AlignCenter, temp_text)
 
 
 # =========================================================
@@ -554,8 +560,8 @@ class TiresCard(QFrame):
         self.setObjectName("tiresCard")
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(8)
+        root.setContentsMargins(8, 5, 8, 5)
+        root.setSpacing(4)
 
         lbl = QLabel("TYRES")
         lbl.setObjectName("sectionLabel")
@@ -574,13 +580,97 @@ class TiresCard(QFrame):
         grid.addWidget(self.fr, 0, 1)
         grid.addWidget(self.rl, 1, 0)
         grid.addWidget(self.rr, 1, 1)
-        root.addLayout(grid)
+        root.addLayout(grid, 1)
 
     def update_view(self, d):
         self.fl.set_values(d["front_left_temp"], d["front_left_wear"])
         self.fr.set_values(d["front_right_temp"], d["front_right_wear"])
         self.rl.set_values(d["rear_left_temp"], d["rear_left_wear"])
         self.rr.set_values(d["rear_right_temp"], d["rear_right_wear"])
+
+
+# =========================================================
+# Inputs Graph
+# =========================================================
+
+class InputsGraphWidget(QWidget):
+    _N = 150  # samples (~30 s at 200 ms/tick)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._throttle = deque([0.0] * self._N, maxlen=self._N)
+        self._brake    = deque([0.0] * self._N, maxlen=self._N)
+        self._steer    = deque([0.5] * self._N, maxlen=self._N)
+        self.setMinimumHeight(60)
+
+    def push(self, throttle, brake, steer):
+        self._throttle.append(throttle)
+        self._brake.append(brake)
+        self._steer.append((steer + 1.0) / 2.0)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.Antialiasing)
+            w, h = self.width(), self.height()
+            n = self._N
+
+            def x_of(i):
+                return i / (n - 1) * w
+
+            def y_of(v):
+                return (1.0 - max(0.0, min(1.0, v))) * h
+
+            for color, buf in (
+                (QColor(0, 210, 70),   self._throttle),
+                (QColor(232, 0, 45),   self._brake),
+                (QColor(60, 140, 255), self._steer),
+            ):
+                p.setPen(QPen(color, 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                data = list(buf)
+                for i in range(1, n):
+                    p.drawLine(
+                        QPointF(x_of(i - 1), y_of(data[i - 1])),
+                        QPointF(x_of(i),     y_of(data[i])),
+                    )
+        finally:
+            if p.isActive():
+                p.end()
+
+
+class InputsCard(QFrame):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("inputsCard")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 8, 12, 8)
+        root.setSpacing(6)
+
+        header = QHBoxLayout()
+        lbl = QLabel("INPUTS")
+        lbl.setObjectName("sectionLabel")
+
+        self._t_dot = QLabel("● T")
+        self._t_dot.setObjectName("inputLegendThrottle")
+        self._b_dot = QLabel("● B")
+        self._b_dot.setObjectName("inputLegendBrake")
+        self._s_dot = QLabel("● S")
+        self._s_dot.setObjectName("inputLegendSteer")
+
+        header.addWidget(lbl)
+        header.addStretch()
+        header.addWidget(self._t_dot)
+        header.addWidget(self._b_dot)
+        header.addWidget(self._s_dot)
+        root.addLayout(header)
+
+        self.graph = InputsGraphWidget()
+        root.addWidget(self.graph, 1)
+
+    def update_view(self, d):
+        self.graph.push(d["throttle"], d["brake"], d["steer"])
 
 
 # =========================================================
@@ -696,9 +786,12 @@ class MainWindow(QMainWindow):
         main.addLayout(right, 1)
 
         self.fuel = FuelCard()
+        self.fuel.setMaximumHeight(130)
+        self.inputs = InputsCard()
         self.tyres = TiresCard()
         right.addWidget(self.fuel)
-        right.addWidget(self.tyres)
+        right.addWidget(self.inputs, 2)
+        right.addWidget(self.tyres, 2)
 
         self._binds, vk_binds = _load_binds()
         self._hotkey_ids = {}
@@ -714,7 +807,7 @@ class MainWindow(QMainWindow):
             QLabel { background: transparent; border: none; padding: 0; }
 
             /* Cards — sharp corners, F1 red left accent bar */
-            #fuelCard, #tiresCard, #trackCard {
+            #fuelCard, #tiresCard, #trackCard, #inputsCard {
                 background: #0c0c0e;
                 border-top:    1px solid rgba(255,255,255,10);
                 border-right:  1px solid rgba(255,255,255,10);
@@ -781,6 +874,11 @@ class MainWindow(QMainWindow):
                 background: #E8002D;
                 border-radius: 1px;
             }
+
+            /* Inputs legend dots */
+            #inputLegendThrottle { font-size: 8px; font-weight: 700; color: #00D246; }
+            #inputLegendBrake    { font-size: 8px; font-weight: 700; color: #E8002D; }
+            #inputLegendSteer    { font-size: 8px; font-weight: 700; color: #3C8CFF; }
 
             /* Mode toggle button — red pill matching card accent */
             #modeBtn {

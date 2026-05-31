@@ -12,3 +12,4 @@
 #   Insert, Delete, Space, Return, Up, Down, Left, Right
 
 cycle_pace_mode = F5
+ 

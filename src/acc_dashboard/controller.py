@@ -2,6 +2,7 @@ from PySide6.QtCore import QTimer
 from .processors.fuel import process_fuel
 from .processors.tires import process_tires
 from .processors.track import process_track
+from .processors.inputs import process_inputs
 
 
 class AppController:
@@ -28,3 +29,5 @@ class AppController:
         self.window.tyres.update_view(tire_data)
         track_data = process_track(sm)
         self.window.track.update_view(track_data)
+        inputs_data = process_inputs(sm)
+        self.window.inputs.update_view(inputs_data)
