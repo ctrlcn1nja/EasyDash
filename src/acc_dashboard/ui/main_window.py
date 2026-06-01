@@ -116,19 +116,31 @@ class MiniMapWidget(QWidget):
         self._pt_index = {}
         self._player_car_rotation = None
         self._compare_mode = "self"
+        self._start_pos = None
+        self._start_idx = None
 
         self.setMinimumHeight(260)
 
     def set_sector_count(self, n: int):
         self._sector_count = max(0, int(n))
 
-    def set_data(self, track_pts, cars, player_car_id=None, player_car_rotation=None):
+    def set_data(self, track_pts, cars, player_car_id=None, player_car_rotation=None, start_pos=None):
+        self._start_pos = start_pos
         self._track_pts = [(float(x), float(z)) for x, z in (track_pts or [])]
         self._cars = cars or []
         self._bounds = self._compute_bounds(self._track_pts) if self._track_pts else None
         self._player_car_id = player_car_id
         self._player_car_rotation = player_car_rotation
         self._pt_index = {pt: i for i, pt in enumerate(self._track_pts)}
+
+        if self._track_pts and self._start_pos is not None:
+            sx, sz = self._start_pos
+            self._start_idx = min(
+                range(len(self._track_pts)),
+                key=lambda i: (self._track_pts[i][0] - sx) ** 2 + (self._track_pts[i][1] - sz) ** 2,
+            )
+        else:
+            self._start_idx = None
 
         if self._track_pts:
             if self._sector_count > 0:
@@ -165,6 +177,10 @@ class MiniMapWidget(QWidget):
                     "last_time_seen": now,
                     "sectors": sectors,
                     "last_sector": None,
+                    "lap_sectors": {si: {"sum": 0.0, "cnt": 0} for si in range(self._sector_count)},
+                    "completed_laps": [],
+                    "best_lap": None,
+                    "best_lap_speed": 0.0,
                 }
 
         self.update()
@@ -194,6 +210,21 @@ class MiniMapWidget(QWidget):
         sec["avg"] = new_avg
         sec["sum"] = 0.0
         sec["cnt"] = 0
+
+    def _complete_lap(self, pace_data: dict):
+        lap_sectors = pace_data.get("lap_sectors", {})
+        sectors_with_data = sum(1 for sv in lap_sectors.values() if sv["cnt"] > 0)
+        if sectors_with_data < max(1, len(lap_sectors) // 2):
+            return  # partial lap — not enough data to record
+        lap_avgs = {
+            s: sv["sum"] / sv["cnt"] if sv["cnt"] > 0 else 0.0
+            for s, sv in lap_sectors.items()
+        }
+        total_speed = sum(lap_avgs.values())
+        pace_data["completed_laps"].append(lap_avgs)
+        if total_speed > pace_data.get("best_lap_speed", 0.0):
+            pace_data["best_lap"] = lap_avgs
+            pace_data["best_lap_speed"] = total_speed
 
     def set_compare_mode(self, mode: str):
         self._compare_mode = mode
@@ -264,6 +295,13 @@ class MiniMapWidget(QWidget):
                         if s >= self._sector_count:
                             s = self._sector_count - 1
 
+                        # Lap crossing: finalise previous lap, reset accumulator
+                        if self._start_idx is not None and idx == self._start_idx:
+                            self._complete_lap(pace_data)
+                            pace_data["lap_sectors"] = {
+                                si: {"sum": 0.0, "cnt": 0} for si in range(self._sector_count)
+                            }
+
                         prev_s = pace_data.get("last_sector")
                         if prev_s is None:
                             pace_data["last_sector"] = s
@@ -274,6 +312,11 @@ class MiniMapWidget(QWidget):
                         sec = pace_data["sectors"][s]
                         sec["sum"] += speed
                         sec["cnt"] += 1
+
+                        lap_sv = pace_data["lap_sectors"].get(s)
+                        if lap_sv is not None:
+                            lap_sv["sum"] += speed
+                            lap_sv["cnt"] += 1
 
                     last_point_seen = points[last_point_seen]["next_point"]
 
@@ -308,23 +351,33 @@ class MiniMapWidget(QWidget):
             if ref <= 0.0:
                 return None
         elif self._compare_mode == "vs_best":
-            # Find the single fastest opponent overall so we compare against one
-            # real car, not a cherry-picked per-sector maximum across different cars.
-            best_pace = None
-            best_total = 0.0
-            for pd in self._pace_list.values():
-                if pd is player_pace:
+            # Compare player's best completed lap against the best completed lap
+            # from any opponent (lap-accurate, not a rolling average).
+            player_best = player_pace.get("best_lap")
+            if player_best is None:
+                return None
+            v = float(player_best.get(s, 0.0))
+            if v <= 0.0:
+                return None
+
+            best_ref = None
+            best_ref_speed = 0.0
+            for opp_id, pd in self._pace_list.items():
+                if opp_id == self._player_car_id:
                     continue
-                total = sum(float(sec2["avg"]) for sec2 in pd["sectors"].values() if sec2["avg"] > 0.0)
-                if total > best_total:
-                    best_total = total
-                    best_pace = pd
-            if best_pace is None:
+                bl = pd.get("best_lap")
+                if bl is None:
+                    continue
+                bl_speed = pd.get("best_lap_speed", 0.0)
+                if bl_speed > best_ref_speed:
+                    best_ref_speed = bl_speed
+                    best_ref = bl
+
+            if best_ref is None:
                 return None
-            ref_sec = best_pace["sectors"].get(s)
-            if ref_sec is None or ref_sec["avg"] <= 0.0:
+            ref = float(best_ref.get(s, 0.0))
+            if ref <= 0.0:
                 return None
-            ref = float(ref_sec["avg"])
         else:  # vs_avg
             opponent_speeds = [
                 float(pd["sectors"][s]["avg"])
@@ -415,6 +468,19 @@ class MiniMapWidget(QWidget):
                 p.setPen(QPen(col, 5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
                 p.drawLine(self._world_to_screen(x1, z1), self._world_to_screen(x2, z2))
 
+            # Start / finish — 4×4 checkered flag (2px cells = 8×8 px total)
+            if self._start_pos is not None:
+                sx, sz = self._start_pos
+                sp = self._world_to_screen(sx, sz)
+                cx, cy = int(sp.x()) - 4, int(sp.y()) - 4
+                cell = 2
+                p.setPen(Qt.NoPen)
+                for row in range(4):
+                    for col in range(4):
+                        white = (row + col) % 2 == 0
+                        p.setBrush(QBrush(QColor(255, 255, 255) if white else QColor(10, 10, 10)))
+                        p.drawRect(cx + col * cell, cy + row * cell, cell, cell)
+
             # Opponents — bright white with dark outline so they pop on every track colour
             for car in self._cars:
                 if car.get("x") == 0 and car.get("z") == 0:
@@ -491,6 +557,7 @@ class TrackCard(QFrame):
             d.get("cars_coordinates", []),
             d.get("player_car_id", None),
             d.get("player_car_rotation", None),
+            d.get("start_pos", None),
         )
         self.map.compute_paces()
         self.map.update()
@@ -790,7 +857,7 @@ class MainWindow(QMainWindow):
         self.inputs = InputsCard()
         self.tyres = TiresCard()
         right.addWidget(self.fuel)
-        right.addWidget(self.inputs, 2)
+        right.addWidget(self.inputs, 1)
         right.addWidget(self.tyres, 2)
 
         self._binds, vk_binds = _load_binds()

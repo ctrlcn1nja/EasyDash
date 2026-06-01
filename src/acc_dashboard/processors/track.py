@@ -32,6 +32,17 @@ def load_track_points(path_to_points: str):
     return out
 
 
+def load_start_coords(folder_path: str):
+    path = Path(folder_path) / "start_cords.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return (float(data["x"]), float(data["z"]))
+    except (KeyError, ValueError, OSError):
+        return None
+
+
 def process_track(sm):
     track_name = safe_track_name(sm.Static.track)
     folder = track_name.lower().replace(" ", "_")
@@ -52,13 +63,16 @@ def process_track(sm):
         is_player = (car_id == player_id) if (car_id is not None and player_id is not None) else False
         cars.append({"x": float(v.x), "y": float(v.y), "z": float(v.z), "car_id": car_id, "is_player": is_player})
 
+    track_folder = str(Path("src/acc_dashboard/resources/tracks") / folder)
     track_points = load_track_points(path_to_points)
+    start_pos = load_start_coords(track_folder)
 
     return {
         "track_name": track_name,
         "path_to_points": path_to_points,
         "flag": flag,
-        "track_points": track_points,       
+        "track_points": track_points,
+        "start_pos": start_pos,
         "cars_coordinates": cars,
         "player_car_id": player_id,
         "player_car_rotation": player_car_rotation
