@@ -174,6 +174,11 @@ def _open_pace_db() -> sqlite3.Connection:
 # =========================================================
 
 class MiniMapWidget(QWidget):
+    # Calibration only: used to convert a plausible max real-world speed into a
+    # points-per-second threshold (via _avg_point_spacing) for teleport detection.
+    # ~350 km/h -> ~97 m/s; 400 m/s gives a safe margin for legitimate driving.
+    _MAX_SPEED_MPS = 400.0
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -191,7 +196,7 @@ class MiniMapWidget(QWidget):
         self._session_mode = "qualifying"
         self._start_pos = None
         self._start_idx = None
-        self._sector_arc_lengths = []
+        self._avg_point_spacing = None
         self._track_name = ""
         self._db = _open_pace_db()
 
@@ -227,17 +232,17 @@ class MiniMapWidget(QWidget):
                     1, (len(self._track_pts) + self._sector_len - 1) // self._sector_len
                 )
 
-            self._sector_arc_lengths = []
-            n = len(self._track_pts)
-            for s in range(self._sector_count):
-                start_i = s * self._sector_len
-                end_i = min((s + 1) * self._sector_len, n)
-                arc = 0.0
-                for i in range(start_i, end_i - 1):
+            # Average distance between consecutive track points, computed once per
+            # track load. Used only to calibrate the teleport-detection threshold
+            # (see compute_paces) -- pace/sector timing itself no longer uses distance.
+            if self._avg_point_spacing is None:
+                n = len(self._track_pts)
+                total_len = 0.0
+                for i in range(n):
                     x1, z1 = self._track_pts[i]
-                    x2, z2 = self._track_pts[i + 1]
-                    arc += ((x2 - x1) ** 2 + (z2 - z1) ** 2) ** 0.5
-                self._sector_arc_lengths.append(arc)
+                    x2, z2 = self._track_pts[(i + 1) % n]
+                    total_len += ((x2 - x1) ** 2 + (z2 - z1) ** 2) ** 0.5
+                self._avg_point_spacing = total_len / n if n > 0 else 1.0
 
         now = self.clock()
 
@@ -251,14 +256,12 @@ class MiniMapWidget(QWidget):
                 for i in range(len(self._track_pts)):
                     pt = self._track_pts[i]
                     points[pt] = {
-                        "speed": 0.0,
-                        "last_speed": 0.0,
                         "next_point": self._track_pts[(i + 1) % len(self._track_pts)],
                     }
 
                 sectors = {}
                 for s in range(self._sector_count):
-                    sectors[s] = {"avg": 0.0, "prev_avg": 0.0, "sum": 0.0, "cnt": 0}
+                    sectors[s] = {"time": None, "prev_time": None}
 
                 self._pace_list[car_id] = {
                     "points": points,
@@ -266,11 +269,12 @@ class MiniMapWidget(QWidget):
                     "last_time_seen": now,
                     "sectors": sectors,
                     "last_sector": None,
-                    "lap_sectors": {si: {"sum": 0.0, "cnt": 0} for si in range(self._sector_count)},
+                    "sector_entry_ts": None,
+                    "lap_sectors": {si: None for si in range(self._sector_count)},
                     "lap_started_at_line": False,
                     "completed_laps": [],
                     "best_lap": None,
-                    "best_lap_speed": 0.0,
+                    "best_lap_time": float("inf"),
                     "last_lap": None,
                 }
 
@@ -290,17 +294,22 @@ class MiniMapWidget(QWidget):
                 closest_pt = pt
         return closest_pt
 
-    def _commit_sector(self, pace_data, sector_id: int):
+    def _commit_sector(self, pace_data, sector_id: int, at_time: float):
         if sector_id is None:
             return
-        sec = pace_data["sectors"].get(sector_id)
-        if not sec or sec["cnt"] <= 0:
+        entry_ts = pace_data.get("sector_entry_ts")
+        if entry_ts is None:
             return
-        new_avg = sec["sum"] / max(sec["cnt"], 1)
-        sec["prev_avg"] = sec["avg"]
-        sec["avg"] = new_avg
-        sec["sum"] = 0.0
-        sec["cnt"] = 0
+        elapsed = at_time - entry_ts
+        if elapsed <= 0:
+            return
+        sec = pace_data["sectors"].get(sector_id)
+        if sec is None:
+            return
+        sec["prev_time"] = sec["time"]
+        sec["time"] = elapsed
+        if sector_id in pace_data["lap_sectors"]:
+            pace_data["lap_sectors"][sector_id] = elapsed
 
     def _log_lap(self, car_id, outcome: str, sectors_ok: int, total: int, started: bool):
         if self._db is None:
@@ -318,7 +327,7 @@ class MiniMapWidget(QWidget):
     def _complete_lap(self, pace_data: dict, car_id=None):
         started = pace_data.get("lap_started_at_line", False)
         lap_sectors = pace_data.get("lap_sectors", {})
-        sectors_with_data = sum(1 for sv in lap_sectors.values() if sv["cnt"] > 0)
+        sectors_with_data = sum(1 for t in lap_sectors.values() if t is not None)
         total = len(lap_sectors)
 
         # Reject any accumulation that didn't begin at the start/finish line.
@@ -338,19 +347,22 @@ class MiniMapWidget(QWidget):
                 return
 
         self._log_lap(car_id, "valid", sectors_with_data, total, started)
-        lap_avgs = {
-            s: sv["sum"] / sv["cnt"] if sv["cnt"] > 0 else 0.0
-            for s, sv in lap_sectors.items()
-        }
-        total_speed = sum(lap_avgs.values())
-        pace_data["completed_laps"].append(lap_avgs)
-        pace_data["last_lap"] = lap_avgs
-        if total_speed > pace_data.get("best_lap_speed", 0.0):
-            pace_data["best_lap"] = lap_avgs
-            pace_data["best_lap_speed"] = total_speed
+        lap_times = dict(lap_sectors)  # sector index -> elapsed seconds (or None if uncrossed)
+        pace_data["completed_laps"].append(lap_times)
+        pace_data["last_lap"] = lap_times
+
+        # Only a fully-covered lap is eligible to be the "best lap" -- a partial
+        # race lap has missing (None) sectors that must never be summed in, or a
+        # half-covered lap would look artificially fast.
+        if sectors_with_data == total:
+            total_time = sum(lap_times.values())
+            if total_time < pace_data.get("best_lap_time", float("inf")):
+                pace_data["best_lap"] = lap_times
+                pace_data["best_lap_time"] = total_time
 
     def reset_paces(self):
         self._pace_list.clear()
+        self._avg_point_spacing = None
 
     def set_compare_mode(self, mode: str):
         self._compare_mode = mode
@@ -401,12 +413,13 @@ class MiniMapWidget(QWidget):
                 pace_data["last_sector"] = None
                 continue
 
+            n_pts = len(self._track_pts)
+
             # Guard: if the car appears to have moved backwards by less than one
             # sector it is drifting in reverse / in the pit lane — skip rather
             # than walking the while-loop the wrong way around the track.
             if cur_idx < last_idx:
                 backward = last_idx - cur_idx
-                n_pts = len(self._track_pts)
                 forward_wrap = cur_idx + (n_pts - last_idx)
                 if backward < forward_wrap and backward < self._sector_len:
                     pace_data["last_point_seen"] = closest_pt
@@ -415,30 +428,18 @@ class MiniMapWidget(QWidget):
                     continue
 
             if closest_pt != last_point_seen:
-                # Arc distance: walk every intermediate segment so curves
-                # don't underestimate the distance (chord < arc in corners).
-                arc_dist = 0.0
-                walk = last_point_seen
-                for _ in range(len(self._track_pts) + 1):
-                    if walk not in points:
-                        break
-                    nxt = points[walk]["next_point"]
-                    dx = nxt[0] - walk[0]
-                    dz = nxt[1] - walk[1]
-                    arc_dist += (dx * dx + dz * dz) ** 0.5
-                    if nxt == closest_pt:
-                        break
-                    walk = nxt
+                steps_fwd = (cur_idx - last_idx) % n_pts
 
-                # Teleport detection: "return to pits" jumps the car by many
-                # track points in one tick, producing physically impossible speed.
-                # At ~350 km/h a car advances at most 2 points/tick (27.5 m / 0.2 s
-                # = 137 m/s).  Real teleports are thousands of m/s; 400 m/s gives
-                # a safe gap while allowing any legitimate high-speed driving.
-                _MAX_SPEED = 400.0  # m/s ≈ 1440 km/h
-                steps_fwd = (cur_idx - last_idx) % len(self._track_pts)
-                computed_speed = arc_dist / dt if dt > 0 else float("inf")
-                if arc_dist <= 0 or computed_speed > _MAX_SPEED:
+                # Teleport detection: "return to pits" jumps the car by many track
+                # points in one tick. Rather than walking distance per-tick (which
+                # both costs time and under-estimates arc through corners), compare
+                # how many points were advanced against a points/sec ceiling derived
+                # once from the track's average point spacing and a plausible max
+                # real-world speed (_MAX_SPEED_MPS). Real teleports advance orders of
+                # magnitude more points per second than any legitimate driving.
+                max_pts_per_sec = self._MAX_SPEED_MPS / max(self._avg_point_spacing or 1.0, 1e-6)
+                points_per_sec = steps_fwd / dt if dt > 0 else float("inf")
+                if points_per_sec > max_pts_per_sec:
                     if self._db is not None:
                         try:
                             self._db.execute(
@@ -446,7 +447,7 @@ class MiniMapWidget(QWidget):
                                 "(ts,track,car_id,arc_dist,dt,speed,steps,last_idx,cur_idx)"
                                 " VALUES(?,?,?,?,?,?,?,?,?)",
                                 (time.time(), self._track_name, car_id,
-                                 arc_dist, dt, computed_speed,
+                                 0.0, dt, points_per_sec,
                                  steps_fwd, last_idx, cur_idx),
                             )
                             self._db.commit()
@@ -455,59 +456,60 @@ class MiniMapWidget(QWidget):
                     pace_data["last_point_seen"] = closest_pt
                     pace_data["last_time_seen"] = now
                     pace_data["last_sector"] = None
-                    pace_data["lap_sectors"] = {
-                        si: {"sum": 0.0, "cnt": 0} for si in range(self._sector_count)
-                    }
+                    pace_data["sector_entry_ts"] = None
+                    pace_data["lap_sectors"] = {si: None for si in range(self._sector_count)}
                     pace_data["lap_started_at_line"] = False
                     continue
 
-                speed = arc_dist / dt
-
-                while last_point_seen != closest_pt:
-                    if last_point_seen not in points:
+                # Walk every point between the last observed position and the
+                # current one so no sector/lap-line crossing is skipped even if
+                # several were passed within a single tick. Each point's arrival
+                # time is linearly interpolated across this tick's dt by its
+                # position in the walk (point-count based, not distance-based) --
+                # the two endpoints (last_point_seen, closest_pt) are exact
+                # observed timestamps; only points strictly between them are
+                # estimated.
+                walk = last_point_seen
+                step_i = 0
+                while walk != closest_pt:
+                    if walk not in points:
                         break
-                    points[last_point_seen]["last_speed"] = points[last_point_seen]["speed"]
-                    points[last_point_seen]["speed"] = speed
 
-                    idx = self._pt_index.get(last_point_seen)
+                    idx = self._pt_index.get(walk)
                     if idx is not None and self._sector_count > 0:
                         s = idx // self._sector_len
                         if s >= self._sector_count:
                             s = self._sector_count - 1
+
+                        arrival_ts = last_time + dt * (step_i / steps_fwd)
 
                         # Lap crossing: finalise previous lap, reset accumulator.
                         # Mark the new lap as valid only after the first crossing so
                         # pit-exit partial laps are never committed as best/last lap.
                         if self._start_idx is not None and idx == self._start_idx:
                             self._complete_lap(pace_data, car_id=car_id)
-                            pace_data["lap_sectors"] = {
-                                si: {"sum": 0.0, "cnt": 0} for si in range(self._sector_count)
-                            }
+                            pace_data["lap_sectors"] = {si: None for si in range(self._sector_count)}
                             pace_data["lap_started_at_line"] = True
 
                         prev_s = pace_data.get("last_sector")
                         if prev_s is None:
                             pace_data["last_sector"] = s
+                            pace_data["sector_entry_ts"] = arrival_ts
                         elif s != prev_s:
-                            self._commit_sector(pace_data, prev_s)
+                            self._commit_sector(pace_data, prev_s, arrival_ts)
                             pace_data["last_sector"] = s
+                            pace_data["sector_entry_ts"] = arrival_ts
 
-                        sec = pace_data["sectors"][s]
-                        sec["sum"] += speed
-                        sec["cnt"] += 1
-
-                        lap_sv = pace_data["lap_sectors"].get(s)
-                        if lap_sv is not None:
-                            lap_sv["sum"] += speed
-                            lap_sv["cnt"] += 1
-
-                    last_point_seen = points[last_point_seen]["next_point"]
+                    walk = points[walk]["next_point"]
+                    step_i += 1
 
                 pace_data["last_point_seen"] = closest_pt
                 pace_data["last_time_seen"] = now
 
     def _get_sector_vref(self, s: int):
-        """Returns (v, ref, rel) for sector s, or None if data is unavailable or pace is too similar."""
+        """Returns (v, ref, rel) — sector times in seconds for sector s — or None
+        if data is unavailable or the times are too similar. rel is positive when
+        v (player) is faster (lower time) than ref."""
         if self._player_car_id is None:
             return None
         player_pace = self._pace_list.get(self._player_car_id)
@@ -518,63 +520,63 @@ class MiniMapWidget(QWidget):
         if not sec:
             return None
 
-        v = float(sec.get("avg", 0.0))
-        if v <= 0.0:
-            return None
-
         lap_key = "last_lap" if self._session_mode == "race" else "best_lap"
 
         if self._compare_mode == "self":
-            ref = float(sec.get("prev_avg", 0.0))
-            if ref <= 0.0:
+            v = sec.get("time")
+            ref = sec.get("prev_time")
+            if v is None or ref is None or v <= 0.0 or ref <= 0.0:
                 return None
         elif self._compare_mode == "vs_best":
             player_lap = player_pace.get(lap_key)
             if player_lap is None:
                 return None
-            v = float(player_lap.get(s, 0.0))
-            if v <= 0.0:
+            v = player_lap.get(s)
+            if v is None or v <= 0.0:
                 return None
 
             best_ref = None
-            best_ref_speed = 0.0
+            best_ref_time = float("inf")
             for opp_id, pd in self._pace_list.items():
                 if opp_id == self._player_car_id:
                     continue
                 opp_lap = pd.get(lap_key)
-                if opp_lap is None:
+                if opp_lap is None or any(t is None for t in opp_lap.values()):
                     continue
-                opp_speed = sum(opp_lap.values())
-                if opp_speed > best_ref_speed:
-                    best_ref_speed = opp_speed
+                opp_time = sum(opp_lap.values())
+                if opp_time < best_ref_time:
+                    best_ref_time = opp_time
                     best_ref = opp_lap
 
             if best_ref is None:
                 return None
-            ref = float(best_ref.get(s, 0.0))
-            if ref <= 0.0:
+            ref = best_ref.get(s)
+            if ref is None or ref <= 0.0:
                 return None
         else:  # vs_avg
             player_lap = player_pace.get(lap_key)
             if player_lap is None:
                 return None
-            v = float(player_lap.get(s, 0.0))
-            if v <= 0.0:
+            v = player_lap.get(s)
+            if v is None or v <= 0.0:
                 return None
 
-            opponent_speeds = [
+            opponent_times = [
                 float(pd[lap_key][s])
                 for pd in self._pace_list.values()
                 if pd is not player_pace
                 and pd.get(lap_key) is not None
                 and s in pd[lap_key]
+                and pd[lap_key][s] is not None
                 and pd[lap_key][s] > 0.0
             ]
-            if not opponent_speeds:
+            if not opponent_times:
                 return None
-            ref = sum(opponent_speeds) / len(opponent_speeds)
+            ref = sum(opponent_times) / len(opponent_times)
 
-        rel = (v - ref) / max(ref, 1e-6)
+        v = float(v)
+        ref = float(ref)
+        rel = (ref - v) / max(ref, 1e-6)
         if abs(rel) < 0.03:
             return None
         return v, ref, rel
@@ -670,7 +672,7 @@ class MiniMapWidget(QWidget):
                 p.drawLine(self._world_to_screen(x1, z1), self._world_to_screen(x2, z2))
 
             # Pass 3 — sector time-gained/lost labels
-            if self._sector_arc_lengths:
+            if self._sector_count > 0:
                 font = QFont()
                 font.setPointSize(7)
                 font.setBold(True)
@@ -684,12 +686,8 @@ class MiniMapWidget(QWidget):
                         continue
                     v, ref, _ = result
 
-                    arc = self._sector_arc_lengths[s] if s < len(self._sector_arc_lengths) else 0.0
-                    if arc <= 0.0:
-                        continue
-
                     # positive = player gains time (player faster than reference)
-                    time_delta = arc / ref - arc / v
+                    time_delta = ref - v
 
                     mid_idx = s * self._sector_len + self._sector_len // 2
                     if mid_idx >= n_pts:
