@@ -1,15 +1,13 @@
 # EasyDash key bindings
 # Format:  action = KeyName
 #
-# How to use with a steering wheel:
-#   1. Open your wheel's profiling software (Thrustmaster Control Panel,
-#      Fanatec Wheel Base, Logitech G HUB, etc.)
-#   2. Bind a wheel button to the keyboard key listed here (e.g. F5)
-#   3. Make sure the EasyDash window is focused (second monitor is ideal)
-#
-# Supported key names:
+# Keyboard keys (work as global hotkeys — no window focus needed):
 #   F1-F12, A-Z, PageUp, PageDown, Home, End,
 #   Insert, Delete, Space, Return, Up, Down, Left, Right
+#
+# Joystick / steering wheel buttons (polled directly, no G HUB mapping needed):
+#   JOY_BUTTON_N  where N matches the button number shown in your wheel software
+#   Example: JOY_BUTTON_25 = Logitech G29 button 25
 
 cycle_pace_mode = F5
  
